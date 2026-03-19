@@ -1,0 +1,19 @@
+[Unit]
+Description=Tempest APRS Weather Gateway
+After=network-online.target direwolf.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/tempest_aprs
+ExecStart=/usr/bin/python3 /home/pi/tempest_aprs/tempest_aprs.py
+Restart=on-failure
+RestartSec=10
+
+# Logging (stdout/stderr → journalctl)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Runtime state / logs
+rain_state.json
+tempest_aprs.log
+tempest_aprs.log.*
+
+# Backup files
+*_bak.py
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code project config
+.claude/
+
+# OS junk
+Thumbs.db
+.DS_Store
