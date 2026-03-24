@@ -147,8 +147,8 @@ def udp_listener():
                 obs = msg.get("ob", [])
                 if len(obs) >= 3:
                     with latest_lock:
-                        latest_weather["wind_direction"] = obs[1]
-                        latest_weather["wind_speed"]     = obs[2]
+                        latest_weather["wind_speed"]     = obs[1]
+                        latest_weather["wind_direction"] = obs[2]
 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON decode error: {e}")
