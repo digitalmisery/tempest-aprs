@@ -8,14 +8,14 @@ Two independent TX loops run as separate threads:
 
   Weather loop  (TRANSMIT_INTERVAL, default 10 min)
     - Sends a weather packet on schedule
-    - Triggered immediately on rain onset or lightning onset
+    - Triggered immediately on rain onset
     - After an immediate TX, the interval resets (no double-transmit)
 
   Status loop   (STATUS_INTERVAL, default 5 min)
-    - Active only while: lightning detected in last 3hr OR currently raining
-    - Sends a combined rain-intensity + lightning status packet
-    - Suppressed entirely when neither condition is true
-    - Also triggered immediately on rain/lightning onset alongside weather TX
+    - Active only while currently raining
+    - Sends a rain-intensity status packet
+    - Suppressed entirely when not raining
+    - Also triggered immediately on rain onset alongside weather TX
 
 Both loops share a single DirewolfClient connection. Access is serialised
 with a transmit lock so packets don't interleave.
@@ -55,17 +55,9 @@ def setup_logging():
 latest_weather = {}
 latest_lock    = threading.Lock()
 
-# Lightning tracker (protected by latest_lock)
-lightning_state = {
-    "last_strike_epoch":   0.0,   # epoch of most recent strike
-    "last_distance_km":    0.0,   # distance of most recent strike
-    "strikes_3hr":         0,     # count of strikes in rolling 3hr window
-    "strike_history":      [],    # list of epoch floats within last 3hr
-}
-
 # Onset trigger events — set by UDP listener, cleared by TX loops
-wx_onset_event     = threading.Event()   # rain or lightning onset → weather TX
-status_onset_event = threading.Event()   # same onset → status TX
+wx_onset_event     = threading.Event()   # rain onset → weather TX
+status_onset_event = threading.Event()   # rain onset → status TX
 onset_reasons      = []                  # human-readable log strings
 
 # Serialises access to the Direwolf connection so both loops can share it
@@ -105,15 +97,8 @@ def udp_listener():
                 prev_rain_zero    = (rain_mm == 0)
                 rain_tracker.update(rain_mm)
 
-                # ── Lightning from obs_st ─────────────────────────────────────
-                strike_count = parsed.get("lightning_count", 0) or 0
-                distance_km  = parsed.get("lightning_distance_km", 0.0) or 0.0
-
-                lightning_onset = False
                 with latest_lock:
                     latest_weather.update(parsed)
-                    if strike_count > 0:
-                        lightning_onset = _record_strike(distance_km)
 
                 # ── Trigger immediate TX if needed ────────────────────────────
                 if rain_just_started:
@@ -122,80 +107,19 @@ def udp_listener():
                     wx_onset_event.set()
                     status_onset_event.set()
 
-                if lightning_onset:
-                    wx_onset_event.set()
-                    status_onset_event.set()
-
                 logger.debug(f"obs_st: {parsed}")
-
-            elif msg_type == "evt_strike":
-                _handle_strike_event(msg)
 
             elif msg_type == "rapid_wind":
                 obs = msg.get("ob", [])
                 if len(obs) >= 3:
                     with latest_lock:
-                        latest_weather["wind_direction"] = obs[1]
-                        latest_weather["wind_speed"]     = obs[2]
+                        latest_weather["wind_speed"]     = obs[1]
+                        latest_weather["wind_direction"] = obs[2]
 
         except json.JSONDecodeError as e:
             logger.warning(f"JSON decode error: {e}")
         except Exception as e:
             logger.error(f"UDP listener error: {e}", exc_info=True)
-
-
-def _record_strike(distance_km: float) -> bool:
-    """
-    Update lightning_state with a new strike at distance_km.
-    Must be called with latest_lock held.
-    Returns True if this qualifies as a lightning onset event.
-    """
-    now    = time.time()
-    ls     = lightning_state
-    cutoff = now - (3 * 3600)
-
-    ls["strike_history"] = [t for t in ls["strike_history"] if t > cutoff]
-    ls["strike_history"].append(now)
-    ls["strikes_3hr"]     = len(ls["strike_history"])
-    ls["last_distance_km"] = distance_km
-
-    gap    = now - ls["last_strike_epoch"]
-    onset  = gap >= config.LIGHTNING_GAP_THRESHOLD
-    ls["last_strike_epoch"] = now
-
-    if onset:
-        logger.info(
-            f"Lightning onset! Gap {gap/3600:.1f}hr, "
-            f"distance {distance_km:.0f}km"
-        )
-        onset_reasons.append(
-            f"lightning onset ({distance_km:.0f}km, gap {gap/3600:.1f}hr)"
-        )
-    return onset
-
-
-def _handle_strike_event(msg: dict):
-    """
-    Handle Tempest evt_strike — fires in real-time at each detection.
-    evt payload: [epoch, distance_km, energy]
-    """
-    try:
-        evt         = msg.get("evt", [])
-        distance_km = float(evt[1])
-
-        with latest_lock:
-            onset = _record_strike(distance_km)
-
-        if onset:
-            wx_onset_event.set()
-            status_onset_event.set()
-
-        logger.debug(
-            f"evt_strike: {distance_km:.0f}km, "
-            f"3hr count={lightning_state['strikes_3hr']}"
-        )
-    except (IndexError, ValueError, TypeError) as e:
-        logger.warning(f"evt_strike parse error: {e}")
 
 
 def parse_obs_st(msg: dict):
@@ -205,8 +129,8 @@ def parse_obs_st(msg: dict):
       0  Epoch
       1  Wind Lull m/s        2  Wind Avg m/s         3  Wind Gust m/s
       4  Wind Dir °           6  Pressure MB           7  Temp C
-      8  Humidity %          11  Solar Radiation W/m²  12  Rain interval mm      13 Precip type
-      14 Lightning dist km   15  Lightning count       18 Rain local day mm
+      8  Humidity %          11  Solar Radiation W/m²  12  Rain interval mm
+      13 Precip type         17  Report interval min   18 Rain local day mm
     """
     try:
         obs = msg["obs"][0]
@@ -228,9 +152,6 @@ def parse_obs_st(msg: dict):
             "report_interval":      int(obs[17]) if len(obs) > 17 and obs[17] is not None else 1,
             "rain_accum_local_day": obs[18] if len(obs) > 18 and obs[18] is not None else 0.0,
         }
-        if len(obs) > 15:
-            result["lightning_distance_km"] = obs[14] if obs[14] is not None else 0.0
-            result["lightning_count"]       = int(obs[15]) if obs[15] is not None else 0
         return result
     except (IndexError, KeyError, TypeError) as e:
         logger.warning(f"parse_obs_st failed: {e}")
@@ -262,13 +183,6 @@ def _is_raining() -> bool:
         return (latest_weather.get("rain_interval_mm", 0.0) or 0.0) > 0
 
 
-def _lightning_active() -> bool:
-    """Return True if there has been a strike within the last 3 hours."""
-    cutoff = time.time() - (3 * 3600)
-    with latest_lock:
-        return lightning_state["last_strike_epoch"] > cutoff
-
-
 # ── Packet builders ───────────────────────────────────────────────────────────
 
 def _build_weather_packet() -> str:
@@ -290,15 +204,10 @@ def _build_weather_packet() -> str:
 
 
 def _build_status_packet() -> str:
-    with latest_lock:
-        ls = dict(lightning_state)
     return aprs_formatter.build_status_packet(
         callsign            = config.CALLSIGN,
         ssid                = config.SSID,
         rain_rate_mm_per_hr = _current_rain_rate_mm_per_hr(),
-        last_strike_epoch   = ls["last_strike_epoch"],
-        last_distance_km    = ls["last_distance_km"],
-        strikes_3hr         = ls["strikes_3hr"],
     )
 
 
@@ -307,7 +216,7 @@ def _build_status_packet() -> str:
 def weather_tx_loop(dw: direwolf_client.DirewolfClient):
     """
     Sends a weather packet every TRANSMIT_INTERVAL seconds.
-    Wakes early on wx_onset_event (rain or lightning onset).
+    Wakes early on wx_onset_event (rain onset).
     Interval resets after every transmit, scheduled or triggered.
     """
     next_tx = time.time() + config.TRANSMIT_INTERVAL
@@ -346,10 +255,9 @@ def weather_tx_loop(dw: direwolf_client.DirewolfClient):
 
 def status_tx_loop(dw: direwolf_client.DirewolfClient):
     """
-    Sends a status packet every STATUS_INTERVAL seconds, BUT ONLY while active:
-      active = lightning in last 3hr  OR  currently raining
+    Sends a status packet every STATUS_INTERVAL seconds, BUT ONLY while raining.
 
-    When inactive the loop sleeps in 30-second polling increments waiting for
+    When not raining, the loop sleeps in 30-second polling increments waiting for
     conditions to become active again (or an onset event to fire).
 
     On an onset event the loop wakes immediately and sends right away,
@@ -359,7 +267,7 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
     next_tx = time.time() + config.STATUS_INTERVAL
 
     while True:
-        active = _is_raining() or _lightning_active()
+        active = _is_raining()
 
         if not active:
             # Nothing to report — poll every 30s for conditions to change,
@@ -381,7 +289,7 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
             logger.info("Status TX triggered immediately by onset event")
 
         # Confirm still active before transmitting (conditions may have just cleared)
-        if not (_is_raining() or _lightning_active()):
+        if not _is_raining():
             logger.debug("Status TX skipped — conditions cleared before transmit")
             next_tx = time.time() + config.STATUS_INTERVAL
             continue
@@ -407,7 +315,6 @@ def main():
     logger.info(f"Callsign:              {config.CALLSIGN}-{config.SSID}")
     logger.info(f"Weather TX interval:   {config.TRANSMIT_INTERVAL}s")
     logger.info(f"Status TX interval:    {config.STATUS_INTERVAL}s (active only)")
-    logger.info(f"Lightning gap threshold: {config.LIGHTNING_GAP_THRESHOLD/3600:.1f}hr")
 
     rain_tracker.load()
 
