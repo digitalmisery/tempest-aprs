@@ -1,26 +1,18 @@
 # rain_tracker.py
 """
 Tracks rain accumulation with:
-  - Per-observation history for last-hour and 24h calculations
-  - Since-midnight total sourced directly from Tempest's local_day_accum
+  - Per-minute bucket history for last-hour and 24h calculations
+  - Daily total that resets at local midnight
   - Persistent state saved to disk so reboots don't lose data
 
-History storage: deque of (epoch_float, local_day_accum_mm) tuples,
-one entry per obs_st, pruned to 25 hours.
+Data source: obs[12] (rain_interval_mm) — the per-observation-interval rain delta.
+We do NOT use obs[18] (local_day_rain_accumulation) because that value is produced
+by WeatherFlow's Rain Check algorithm and can lag or remain 0 during active rain,
+causing the weather packet to report zero accumulation while rain is actually falling.
+By accumulating obs[12] deltas ourselves we stay in sync with the same raw data
+source used by the status packet's rain-rate calculation.
 
-All three accumulators derive from the same history deque:
-
-  since_midnight -- directly from Tempest's local_day_accum (resets at
-                    local midnight on the device; we mirror that reset)
-
-  last_hour      -- max(local_day_accum in last 60 min)
-                    minus the entry just before the 60-min window opened.
-                    Falls back to max - min if no pre-window entry exists.
-                    Handles midnight resets by detecting drops in the series.
-
-  last_24h       -- sums incremental deltas across the full 25h history,
-                    treating any drop in the series as a midnight reset
-                    (adds the post-reset value directly instead of a negative).
+Schema version 2: history stores (epoch, delta_mm) tuples — NOT cumulative values.
 """
 
 import json
@@ -33,54 +25,66 @@ import config
 
 logger = logging.getLogger("tempest_aprs.rain")
 
-# -- Internal state ------------------------------------------------------------
-# deque of (epoch_float, local_day_accum_mm) -- one entry per obs_st
-_history: deque = deque()
-_since_midnight_mm: float = 0.0   # mirrors Tempest's local_day_accum
-_last_reset_date:   str   = ""    # "YYYY-MM-DD" of last midnight reset
-_last_day_accum:    float = 0.0   # last known local_day_accum from Tempest
+STATE_SCHEMA_VERSION = 2
+
+# ── Internal state ────────────────────────────────────────────────────────────
+# Each entry is (epoch_float, delta_mm) for one obs_st observation interval.
+# Only non-zero intervals are stored to keep history compact.
+_history: deque = deque()       # deque of (epoch_float, delta_mm)
+_since_midnight_mm: float = 0.0 # running sum of deltas since local midnight
+_last_reset_date: str = ""      # "YYYY-MM-DD" of last midnight reset
 
 
 def load():
     """Load persisted rain state from disk on startup."""
-    global _since_midnight_mm, _last_reset_date, _last_day_accum
+    global _since_midnight_mm, _last_reset_date
 
     path = config.RAIN_STATE_FILE
     if not os.path.exists(path):
-        logger.info("No rain state file found -- starting fresh")
+        logger.info("No rain state file found — starting fresh")
         _last_reset_date = _today_str()
         return
 
     try:
         with open(path) as f:
             state = json.load(f)
+
+        # Schema v1 stored cumulative values in history; discard that history
+        # because it is incompatible with delta-based get_* functions.
+        schema = state.get("schema_version", 1)
+        if schema < STATE_SCHEMA_VERSION:
+            logger.info(
+                f"Rain state schema v{schema} detected — discarding old history "
+                f"(since_midnight total is preserved)"
+            )
+            _history.clear()
+        else:
+            for entry in state.get("history", []):
+                _history.append((entry[0], entry[1]))
+
         _since_midnight_mm = state.get("since_midnight_mm", 0.0)
         _last_reset_date   = state.get("last_reset_date", _today_str())
-        _last_day_accum    = state.get("last_day_accum", 0.0)
-
-        for entry in state.get("history", []):
-            _history.append((entry[0], entry[1]))
 
         logger.info(
-            f"Rain state loaded: {_since_midnight_mm:.2f}mm since midnight "
+            f"Rain state loaded: {_since_midnight_mm:.2f} mm since midnight "
             f"on {_last_reset_date}, {len(_history)} history entries"
         )
     except Exception as e:
-        logger.error(f"Failed to load rain state: {e} -- starting fresh")
+        logger.error(f"Failed to load rain state: {e} — starting fresh")
         _last_reset_date = _today_str()
 
 
 def save():
     """Persist rain state to disk."""
     path = config.RAIN_STATE_FILE
-    dir_ = os.path.dirname(path)
-    if dir_:
-        os.makedirs(dir_, exist_ok=True)
+    dir_part = os.path.dirname(path)
+    if dir_part:
+        os.makedirs(dir_part, exist_ok=True)
     try:
         state = {
+            "schema_version":    STATE_SCHEMA_VERSION,
             "since_midnight_mm": _since_midnight_mm,
             "last_reset_date":   _last_reset_date,
-            "last_day_accum":    _last_day_accum,
             "history":           list(_history),
             "saved_at":          time.time(),
         }
@@ -90,44 +94,43 @@ def save():
         logger.error(f"Failed to save rain state: {e}")
 
 
-def update(local_day_accum_mm: float):
+def update(interval_mm: float):
     """
-    Called on every obs_st with the Tempest's local_day_accum value (mm).
-    The Tempest resets this counter at local midnight automatically.
+    Called on every obs_st packet with obs[12] — the rainfall delta for that
+    observation interval (mm).  Accumulates into running totals and history.
+
+    Args:
+        interval_mm: Rain that fell during this observation interval (mm).
+                     Must be non-negative.  Pass 0.0 when no rain occurred.
     """
-    global _since_midnight_mm, _last_reset_date, _last_day_accum
+    global _since_midnight_mm, _last_reset_date
+
+    if interval_mm < 0:
+        interval_mm = 0.0
 
     today = _today_str()
 
-    # -- Host-clock midnight rollover ------------------------------------------
+    # ── Midnight reset ────────────────────────────────────────────────────────
     if today != _last_reset_date:
         logger.info(
-            f"Midnight rollover: resetting rain counter "
-            f"({_last_reset_date} -> {today})"
+            f"Midnight rollover: resetting since-midnight counter "
+            f"({_last_reset_date} → {today})"
         )
         _since_midnight_mm = 0.0
         _last_reset_date   = today
-        _last_day_accum    = 0.0
+        save()
 
-    # -- Tempest device midnight reset -----------------------------------------
-    # Tempest resets local_day_accum to 0 at midnight. If the value drops
-    # more than 0.5mm it's a reset, not a measurement correction.
-    if local_day_accum_mm < _last_day_accum - 0.5:
-        logger.info(
-            f"Tempest local_day_accum reset detected "
-            f"({_last_day_accum:.2f} -> {local_day_accum_mm:.2f}mm)"
-        )
+    # ── Accumulate delta ──────────────────────────────────────────────────────
+    _since_midnight_mm += interval_mm
 
-    _since_midnight_mm = local_day_accum_mm
-    _last_day_accum    = local_day_accum_mm
-
-    # -- Append to rolling history ---------------------------------------------
+    # Only store non-zero intervals so history stays compact
     epoch = time.time()
-    _history.append((epoch, local_day_accum_mm))
+    if interval_mm > 0:
+        _history.append((epoch, interval_mm))
 
     # Trim entries older than 25 hours
-    cutoff_25h = epoch - (25 * 3600)
-    while _history and _history[0][0] < cutoff_25h:
+    cutoff_24h = epoch - (25 * 3600)
+    while _history and _history[0][0] < cutoff_24h:
         _history.popleft()
 
     save()
@@ -139,78 +142,19 @@ def get_since_midnight_mm() -> float:
 
 
 def get_last_hour_mm() -> float:
-    """
-    Rain accumulated in the last 60 minutes (mm).
-
-    Strategy: find the entry immediately before the 60-min window opened
-    and subtract it from the cumulative total gained inside the window.
-    This correctly handles the cumulative nature of local_day_accum.
-
-    If no pre-window baseline exists (history covers < 1 hour), fall back
-    to accumulation from the oldest available entry.
-
-    Midnight resets are detected as a drop in the series; the post-reset
-    portion is added as new accumulation rather than subtracted.
-    """
+    """Rain accumulated in the last 60 minutes (mm)."""
     if not _history:
         return 0.0
-
-    now    = time.time()
-    cutoff = now - 3600
-
-    before_window = [(ts, mm) for (ts, mm) in _history if ts < cutoff]
-    in_window     = [(ts, mm) for (ts, mm) in _history if ts >= cutoff]
-
-    if not in_window:
-        return 0.0
-
-    # Baseline: last reading before window, or first reading inside window
-    baseline = before_window[-1][1] if before_window else in_window[0][1]
-
-    total   = 0.0
-    prev_mm = baseline
-    for (_, mm) in in_window:
-        if mm >= prev_mm:
-            total += mm - prev_mm
-        else:
-            # Midnight reset inside the window -- post-reset value is new rain
-            total += mm
-        prev_mm = mm
-
-    return max(0.0, total)
+    cutoff = time.time() - 3600
+    return sum(mm for (ts, mm) in _history if ts >= cutoff)
 
 
 def get_last_24h_mm() -> float:
-    """
-    Rain accumulated in the last 24 hours (mm). Spans midnight correctly.
-
-    Sums incremental deltas across all history entries in the 24h window,
-    treating any drop in the series as a midnight reset.
-    """
+    """Rain accumulated in the last 24 hours (mm). Spans midnight correctly."""
     if not _history:
         return 0.0
-
-    now    = time.time()
-    cutoff = now - 86400
-
-    before_window = [(ts, mm) for (ts, mm) in _history if ts < cutoff]
-    in_window     = [(ts, mm) for (ts, mm) in _history if ts >= cutoff]
-
-    if not in_window:
-        return 0.0
-
-    baseline = before_window[-1][1] if before_window else in_window[0][1]
-
-    total   = 0.0
-    prev_mm = baseline
-    for (_, mm) in in_window:
-        if mm >= prev_mm:
-            total += mm - prev_mm
-        else:
-            total += mm
-        prev_mm = mm
-
-    return max(0.0, total)
+    cutoff = time.time() - 86400
+    return sum(mm for (ts, mm) in _history if ts >= cutoff)
 
 
 def _today_str() -> str:
