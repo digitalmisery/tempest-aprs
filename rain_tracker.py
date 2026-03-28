@@ -114,7 +114,7 @@ def update(interval_mm: float):
     if today != _last_reset_date:
         logger.info(
             f"Midnight rollover: resetting since-midnight counter "
-            f"({_last_reset_date} → {today})"
+            f"({_last_reset_date} -> {today})"
         )
         _since_midnight_mm = 0.0
         _last_reset_date   = today

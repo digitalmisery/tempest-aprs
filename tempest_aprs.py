@@ -14,8 +14,9 @@ Two independent TX loops run as separate threads:
   Status loop   (STATUS_INTERVAL, default 5 min)
     - Active only while currently raining
     - Sends a rain-intensity status packet
-    - Suppressed entirely when not raining
     - Also triggered immediately on rain onset alongside weather TX
+    - During quiet periods, sends heartbeat packets to keep station visible
+      (first after HEARTBEAT_DELAY, then every HEARTBEAT_INTERVAL)
 
 Both loops share a single DirewolfClient connection. Access is serialised
 with a transmit lock so packets don't interleave.
@@ -211,6 +212,13 @@ def _build_status_packet() -> str:
     )
 
 
+def _build_heartbeat_packet() -> str:
+    return aprs_formatter.build_heartbeat_packet(
+        callsign = config.CALLSIGN,
+        ssid     = config.SSID,
+    )
+
+
 # ── Weather TX loop ───────────────────────────────────────────────────────────
 
 def weather_tx_loop(dw: direwolf_client.DirewolfClient):
@@ -255,32 +263,53 @@ def weather_tx_loop(dw: direwolf_client.DirewolfClient):
 
 def status_tx_loop(dw: direwolf_client.DirewolfClient):
     """
-    Sends a status packet every STATUS_INTERVAL seconds, BUT ONLY while raining.
+    Sends a status packet every STATUS_INTERVAL seconds while raining.
 
-    When not raining, the loop sleeps in 30-second polling increments waiting for
-    conditions to become active again (or an onset event to fire).
+    When not raining, sends heartbeat packets to keep the station visible:
+      - First heartbeat after HEARTBEAT_DELAY seconds of quiet
+      - Subsequent heartbeats every HEARTBEAT_INTERVAL seconds
 
     On an onset event the loop wakes immediately and sends right away,
     then resumes the normal STATUS_INTERVAL cadence.
     """
     POLL_INTERVAL = 30   # how often to recheck active state when idle (seconds)
     next_tx = time.time() + config.STATUS_INTERVAL
+    conditions_cleared_at = time.time()   # when rain last stopped
+    next_heartbeat = conditions_cleared_at + config.HEARTBEAT_DELAY
 
     while True:
         active = _is_raining()
 
         if not active:
-            # Nothing to report — poll every 30s for conditions to change,
-            # but also wake immediately if an onset event fires
-            triggered = status_onset_event.wait(timeout=POLL_INTERVAL)
+            # Check if it's time to send a heartbeat
+            now = time.time()
+            wait_hb = max(0, next_heartbeat - now)
+            wait    = min(POLL_INTERVAL, wait_hb)
+
+            triggered = status_onset_event.wait(timeout=wait)
             if triggered:
                 status_onset_event.clear()
                 logger.info("Status loop woken by onset event — sending immediately")
-                # Fall through to transmit below (active will now be True)
+                # Fall through to transmit below
+            elif time.time() >= next_heartbeat:
+                # Time to send a heartbeat
+                try:
+                    packet = _build_heartbeat_packet()
+                    logger.info(f"Sending heartbeat packet: {packet}")
+                    with tx_lock:
+                        time.sleep(1)
+                        dw.send_packet(packet)
+                except Exception as e:
+                    logger.error(f"Heartbeat TX error: {e}", exc_info=True)
+                next_heartbeat = time.time() + config.HEARTBEAT_INTERVAL
+                continue
             else:
                 continue   # still inactive, keep polling
 
-        # Active — wait until next_tx or an onset trigger, whichever is sooner
+        # Active — reset heartbeat schedule for when conditions clear
+        conditions_cleared_at = None
+
+        # Wait until next_tx or an onset trigger, whichever is sooner
         wait      = max(0, next_tx - time.time())
         triggered = status_onset_event.wait(timeout=wait)
 
@@ -291,6 +320,8 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
         # Confirm still active before transmitting (conditions may have just cleared)
         if not _is_raining():
             logger.debug("Status TX skipped — conditions cleared before transmit")
+            conditions_cleared_at = time.time()
+            next_heartbeat = conditions_cleared_at + config.HEARTBEAT_DELAY
             next_tx = time.time() + config.STATUS_INTERVAL
             continue
 
@@ -315,6 +346,7 @@ def main():
     logger.info(f"Callsign:              {config.CALLSIGN}-{config.SSID}")
     logger.info(f"Weather TX interval:   {config.TRANSMIT_INTERVAL}s")
     logger.info(f"Status TX interval:    {config.STATUS_INTERVAL}s (active only)")
+    logger.info(f"Heartbeat:             {config.HEARTBEAT_DELAY}s delay, then every {config.HEARTBEAT_INTERVAL}s")
 
     rain_tracker.load()
 

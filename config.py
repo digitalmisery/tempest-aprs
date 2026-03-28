@@ -26,7 +26,7 @@ STATUS_INTERVAL = 300
 # and the interval between subsequent heartbeats during quiet periods (seconds)
 # 10800 = 3 hours  |  86400 = 24 hours
 HEARTBEAT_DELAY    = 3600   # delay after conditions clear before first heartbeat
-HEARTBEAT_INTERVAL = 86400   # interval between heartbeats during quiet periods
+HEARTBEAT_INTERVAL = 10800   # interval between heartbeats during quiet periods
 
 # ── Tempest settings ──────────────────────────────────────────────────────────
 TEMPEST_UDP_PORT = 50222    # Tempest hub broadcasts on this port — do not change
