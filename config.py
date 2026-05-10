@@ -10,6 +10,12 @@ SSID     = "13"
 # Find yours at: https://www.latlong.net/
 LATITUDE  =  43.3228   # positive = North, negative = South
 LONGITUDE = -87.9849   # positive = East,  negative = West
+
+# ── Output Routing ────────────────────────────────────────────────────────────
+
+# Select where to send the APRS packets. Options: "RF", "APRS-IS", or "BOTH"
+OUTPUT_MODE = "BOTH"
+
 # ── Transmit intervals ────────────────────────────────────────────────────────
 
 # How often to send the APRS weather packet (seconds)
@@ -25,7 +31,7 @@ STATUS_INTERVAL = 300
 # How long after conditions clear before sending a heartbeat status packet,
 # and the interval between subsequent heartbeats during quiet periods (seconds)
 # 10800 = 3 hours  |  86400 = 24 hours
-HEARTBEAT_DELAY    = 3600   # delay after conditions clear before first heartbeat
+HEARTBEAT_DELAY    = 60   # delay after conditions clear before first heartbeat
 HEARTBEAT_INTERVAL = 10800   # interval between heartbeats during quiet periods
 
 # ── Tempest settings ──────────────────────────────────────────────────────────
@@ -34,6 +40,10 @@ TEMPEST_UDP_PORT = 50222    # Tempest hub broadcasts on this port — do not cha
 # ── Direwolf settings ─────────────────────────────────────────────────────────
 DIREWOLF_HOST = "127.0.0.1"
 DIREWOLF_PORT = 8001          # KISS TCP port (default Direwolf)
+
+# ── APRS-IS settings (Used if OUTPUT_MODE is "APRS-IS" or "BOTH") ─────────────
+APRS_IS_SERVER = "rotate.aprs2.net"
+APRS_IS_PORT   = 14580
 
 # ── File paths ────────────────────────────────────────────────────────────────
 # Windows paths for testing — change to /var/log/... and /var/lib/... on the Pi

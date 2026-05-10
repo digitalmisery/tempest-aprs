@@ -2,13 +2,13 @@
 """
 tempest_aprs.py
 Listens for Weatherflow Tempest UDP broadcasts on LAN,
-converts weather data to APRS packets, and sends them to Direwolf.
+converts weather data to APRS packets, and sends them to Direwolf and/or APRS-IS.
 
 Two independent TX loops run as separate threads:
 
   Weather loop  (TRANSMIT_INTERVAL, default 10 min)
     - Sends a weather packet on schedule
-    - Triggered immediately on rain onset
+    - Triggered immediately on rain onset or application startup
     - After an immediate TX, the interval resets (no double-transmit)
 
   Status loop   (STATUS_INTERVAL, default 5 min)
@@ -18,8 +18,8 @@ Two independent TX loops run as separate threads:
     - During quiet periods, sends heartbeat packets to keep station visible
       (first after HEARTBEAT_DELAY, then every HEARTBEAT_INTERVAL)
 
-Both loops share a single DirewolfClient connection. Access is serialised
-with a transmit lock so packets don't interleave.
+Both loops route packets based on the OUTPUT_MODE configuration ("RF", "APRS-IS", "BOTH").
+Access is serialised with a transmit lock so packets don't interleave.
 """
 
 import socket
@@ -33,6 +33,7 @@ import config
 import rain_tracker
 import aprs_formatter
 import direwolf_client
+import aprs_is_client  # NEW: Import the APRS-IS client
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("tempest_aprs")
@@ -51,22 +52,34 @@ def setup_logging():
     logger.addHandler(fh)
     logger.addHandler(ch)
 
-
 # ── Shared state ──────────────────────────────────────────────────────────────
 latest_weather = {}
 latest_lock    = threading.Lock()
 
 # Onset trigger events — set by UDP listener, cleared by TX loops
-wx_onset_event     = threading.Event()   # rain onset → weather TX
+wx_onset_event     = threading.Event()   # rain onset/startup → weather TX
 status_onset_event = threading.Event()   # rain onset → status TX
 onset_reasons      = []                  # human-readable log strings
 
-# Serialises access to the Direwolf connection so both loops can share it
+# Serialises access to the transmission connections
 tx_lock = threading.Lock()
 
+# ── Output Routing Logic ──────────────────────────────────────────────────────
+def transmit_packet(packet_str: str, dw=None, aprsis=None):
+    """Routes the formatted APRS packet to the configured destinations."""
+    output_mode = getattr(config, "OUTPUT_MODE", "RF").upper()
+    
+    with tx_lock:
+        if output_mode in ["RF", "BOTH"] and dw:
+            dw.send_packet(packet_str)
+            # Small delay to prevent network/RF collisions
+            time.sleep(0.5)
+            
+        if output_mode in ["APRS-IS", "BOTH"] and aprsis:
+            aprsis.send_packet(packet_str)
+            time.sleep(0.5)
 
 # ── UDP Listener ──────────────────────────────────────────────────────────────
-
 def udp_listener():
     """Receive Tempest UDP broadcasts and update shared state."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -75,6 +88,7 @@ def udp_listener():
     logger.info(f"Listening for Tempest data on UDP port {config.TEMPEST_UDP_PORT}")
 
     prev_rain_zero = True
+    first_packet_received = False  # Track first packet startup
 
     while True:
         try:
@@ -88,11 +102,6 @@ def udp_listener():
                     continue
 
                 # ── Rain onset ────────────────────────────────────────────────
-                # Use obs[12] (rain_interval_mm) — the per-interval delta —
-                # NOT obs[18] (rain_accum_local_day).  obs[18] is produced by
-                # WeatherFlow's Rain Check algorithm and can remain 0 during
-                # active rain, causing all accumulation to report zero while
-                # status packets correctly show a non-zero rate.
                 rain_mm           = parsed.get("rain_interval_mm", 0.0) or 0.0
                 rain_just_started = prev_rain_zero and rain_mm > 0
                 prev_rain_zero    = (rain_mm == 0)
@@ -101,8 +110,13 @@ def udp_listener():
                 with latest_lock:
                     latest_weather.update(parsed)
 
-                # ── Trigger immediate TX if needed ────────────────────────────
-                if rain_just_started:
+                # ── Trigger immediate TX on first packet or rain onset ───────
+                if not first_packet_received:
+                    first_packet_received = True
+                    logger.info("First obs_st received — triggering initial transmission immediately.")
+                    onset_reasons.append("initial startup")
+                    wx_onset_event.set()
+                elif rain_just_started:
                     logger.info("Rain onset — triggering immediate TX")
                     onset_reasons.append("rain onset")
                     wx_onset_event.set()
@@ -124,15 +138,7 @@ def udp_listener():
 
 
 def parse_obs_st(msg: dict):
-    """
-    Parse obs_st message. Returns dict or None.
-    Key Tempest obs_st array indices (UDP API v171):
-      0  Epoch
-      1  Wind Lull m/s        2  Wind Avg m/s         3  Wind Gust m/s
-      4  Wind Dir °           6  Pressure MB           7  Temp C
-      8  Humidity %          11  Solar Radiation W/m²  12  Rain interval mm
-      13 Precip type         17  Report interval min   18 Rain local day mm
-    """
+    """Parse obs_st message. Returns dict or None."""
     try:
         obs = msg["obs"][0]
         result = {
@@ -144,11 +150,8 @@ def parse_obs_st(msg: dict):
             "pressure":             obs[6],
             "temperature":          obs[7],
             "humidity":             obs[8],
-            # Solar radiation W/m² (obs index 11)
             "solar_radiation":      obs[11] if len(obs) > 11 and obs[11] is not None else 0,
-            # Interval rain (mm) — used to compute rain rate
             "rain_interval_mm":     obs[12] if obs[12] is not None else 0.0,
-            # Precipitation type: 0=none, 1=rain, 2=hail, 3=mix
             "precip_type":          int(obs[13]) if len(obs) > 13 and obs[13] is not None else 0,
             "report_interval":      int(obs[17]) if len(obs) > 17 and obs[17] is not None else 1,
             "rain_accum_local_day": obs[18] if len(obs) > 18 and obs[18] is not None else 0.0,
@@ -160,32 +163,20 @@ def parse_obs_st(msg: dict):
 
 
 # ── Rain rate calculation ─────────────────────────────────────────────────────
-
 def _current_rain_rate_mm_per_hr() -> float:
-    """
-    Compute current rain rate in mm/hr from the most recent obs_st interval rain.
-    The Tempest reports interval rain in mm over its report interval (default 1 min).
-    We scale to mm/hr.
-    """
     with latest_lock:
         interval_mm   = latest_weather.get("rain_interval_mm", 0.0) or 0.0
         report_interval_min = latest_weather.get("report_interval", 1) or 1
-
-    # obs index 17 is report interval in minutes — capture it in parse
-    # (we fall back to 1 min if not available, which is the Tempest default)
     if interval_mm <= 0:
         return 0.0
     return interval_mm * (60.0 / report_interval_min)
 
-
 def _is_raining() -> bool:
-    """Return True if the station is currently detecting precipitation."""
     with latest_lock:
         return (latest_weather.get("rain_interval_mm", 0.0) or 0.0) > 0
 
 
 # ── Packet builders ───────────────────────────────────────────────────────────
-
 def _build_weather_packet() -> str:
     with latest_lock:
         wx = dict(latest_weather)
@@ -203,14 +194,12 @@ def _build_weather_packet() -> str:
         rain_midnight_mm = rain_midnight,
     )
 
-
 def _build_status_packet() -> str:
     return aprs_formatter.build_status_packet(
         callsign            = config.CALLSIGN,
         ssid                = config.SSID,
         rain_rate_mm_per_hr = _current_rain_rate_mm_per_hr(),
     )
-
 
 def _build_heartbeat_packet() -> str:
     return aprs_formatter.build_heartbeat_packet(
@@ -220,13 +209,7 @@ def _build_heartbeat_packet() -> str:
 
 
 # ── Weather TX loop ───────────────────────────────────────────────────────────
-
-def weather_tx_loop(dw: direwolf_client.DirewolfClient):
-    """
-    Sends a weather packet every TRANSMIT_INTERVAL seconds.
-    Wakes early on wx_onset_event (rain onset).
-    Interval resets after every transmit, scheduled or triggered.
-    """
+def weather_tx_loop(dw: direwolf_client.DirewolfClient, aprsis: aprs_is_client.APRSISClient):
     next_tx = time.time() + config.TRANSMIT_INTERVAL
 
     while True:
@@ -236,6 +219,7 @@ def weather_tx_loop(dw: direwolf_client.DirewolfClient):
         if triggered:
             reasons = ", ".join(onset_reasons) if onset_reasons else "onset"
             logger.info(f"Weather TX triggered by: {reasons}")
+            onset_reasons.clear() # Clear the array to prevent memory bloat 
             wx_onset_event.clear()
         else:
             logger.debug("Scheduled weather TX")
@@ -251,8 +235,7 @@ def weather_tx_loop(dw: direwolf_client.DirewolfClient):
         try:
             packet = _build_weather_packet()
             logger.info(f"Sending weather packet: {packet}")
-            with tx_lock:
-                dw.send_packet(packet)
+            transmit_packet(packet, dw, aprsis)
         except Exception as e:
             logger.error(f"Weather TX error: {e}", exc_info=True)
 
@@ -260,28 +243,16 @@ def weather_tx_loop(dw: direwolf_client.DirewolfClient):
 
 
 # ── Status TX loop ────────────────────────────────────────────────────────────
-
-def status_tx_loop(dw: direwolf_client.DirewolfClient):
-    """
-    Sends a status packet every STATUS_INTERVAL seconds while raining.
-
-    When not raining, sends heartbeat packets to keep the station visible:
-      - First heartbeat after HEARTBEAT_DELAY seconds of quiet
-      - Subsequent heartbeats every HEARTBEAT_INTERVAL seconds
-
-    On an onset event the loop wakes immediately and sends right away,
-    then resumes the normal STATUS_INTERVAL cadence.
-    """
-    POLL_INTERVAL = 30   # how often to recheck active state when idle (seconds)
+def status_tx_loop(dw: direwolf_client.DirewolfClient, aprsis: aprs_is_client.APRSISClient):
+    POLL_INTERVAL = 30
     next_tx = time.time() + config.STATUS_INTERVAL
-    conditions_cleared_at = time.time()   # when rain last stopped
+    conditions_cleared_at = time.time()
     next_heartbeat = conditions_cleared_at + config.HEARTBEAT_DELAY
 
     while True:
         active = _is_raining()
 
         if not active:
-            # Check if it's time to send a heartbeat
             now = time.time()
             wait_hb = max(0, next_heartbeat - now)
             wait    = min(POLL_INTERVAL, wait_hb)
@@ -290,26 +261,19 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
             if triggered:
                 status_onset_event.clear()
                 logger.info("Status loop woken by onset event — sending immediately")
-                # Fall through to transmit below
             elif time.time() >= next_heartbeat:
-                # Time to send a heartbeat
                 try:
                     packet = _build_heartbeat_packet()
                     logger.info(f"Sending heartbeat packet: {packet}")
-                    with tx_lock:
-                        time.sleep(1)
-                        dw.send_packet(packet)
+                    transmit_packet(packet, dw, aprsis)
                 except Exception as e:
                     logger.error(f"Heartbeat TX error: {e}", exc_info=True)
                 next_heartbeat = time.time() + config.HEARTBEAT_INTERVAL
                 continue
             else:
-                continue   # still inactive, keep polling
+                continue
 
-        # Active — reset heartbeat schedule for when conditions clear
         conditions_cleared_at = None
-
-        # Wait until next_tx or an onset trigger, whichever is sooner
         wait      = max(0, next_tx - time.time())
         triggered = status_onset_event.wait(timeout=wait)
 
@@ -317,7 +281,6 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
             status_onset_event.clear()
             logger.info("Status TX triggered immediately by onset event")
 
-        # Confirm still active before transmitting (conditions may have just cleared)
         if not _is_raining():
             logger.debug("Status TX skipped — conditions cleared before transmit")
             conditions_cleared_at = time.time()
@@ -328,10 +291,7 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
         try:
             packet = _build_status_packet()
             logger.info(f"Sending status packet: {packet}")
-            with tx_lock:
-                # Small gap after weather packet if both fire simultaneously
-                time.sleep(1)
-                dw.send_packet(packet)
+            transmit_packet(packet, dw, aprsis)
         except Exception as e:
             logger.error(f"Status TX error: {e}", exc_info=True)
 
@@ -339,25 +299,42 @@ def status_tx_loop(dw: direwolf_client.DirewolfClient):
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-
 def main():
     setup_logging()
+    
+    # Safely load config values using getattr to allow backwards compatibility
+    output_mode = getattr(config, "OUTPUT_MODE", "RF").upper()
+    aprs_server = getattr(config, "APRS_IS_SERVER", "rotate.aprs2.net")
+    aprs_port = getattr(config, "APRS_IS_PORT", 14580)
+    
     logger.info("=== Tempest APRS starting up ===")
     logger.info(f"Callsign:              {config.CALLSIGN}-{config.SSID}")
+    logger.info(f"Output Mode:           {output_mode}")
     logger.info(f"Weather TX interval:   {config.TRANSMIT_INTERVAL}s")
     logger.info(f"Status TX interval:    {config.STATUS_INTERVAL}s (active only)")
-    logger.info(f"Heartbeat:             {config.HEARTBEAT_DELAY}s delay, then every {config.HEARTBEAT_INTERVAL}s")
 
     rain_tracker.load()
 
-    dw = direwolf_client.DirewolfClient(
-        host=config.DIREWOLF_HOST,
-        port=config.DIREWOLF_PORT
-    )
+    dw = None
+    aprsis = None
 
-    t_udp    = threading.Thread(target=udp_listener,                  daemon=True, name="udp_listener")
-    t_wx     = threading.Thread(target=weather_tx_loop, args=(dw,),   daemon=True, name="wx_tx")
-    t_status = threading.Thread(target=status_tx_loop,  args=(dw,),   daemon=True, name="status_tx")
+    if output_mode in ["RF", "BOTH"]:
+        dw = direwolf_client.DirewolfClient(
+            host=config.DIREWOLF_HOST,
+            port=config.DIREWOLF_PORT
+        )
+        
+    if output_mode in ["APRS-IS", "BOTH"]:
+        full_callsign = f"{config.CALLSIGN}-{config.SSID}"
+        aprsis = aprs_is_client.APRSISClient(
+            callsign=full_callsign,
+            server=aprs_server,
+            port=aprs_port
+        )
+
+    t_udp    = threading.Thread(target=udp_listener, daemon=True, name="udp_listener")
+    t_wx     = threading.Thread(target=weather_tx_loop, args=(dw, aprsis), daemon=True, name="wx_tx")
+    t_status = threading.Thread(target=status_tx_loop,  args=(dw, aprsis), daemon=True, name="status_tx")
 
     t_udp.start()
     t_wx.start()
@@ -376,7 +353,6 @@ def main():
     except KeyboardInterrupt:
         logger.info("Shutting down.")
         rain_tracker.save()
-
 
 if __name__ == "__main__":
     main()

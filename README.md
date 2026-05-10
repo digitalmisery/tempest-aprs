@@ -30,6 +30,7 @@ The result: your personal weather station data appears on the APRS network (visi
 
 ### Smart Transmit Behavior
 
+- **Immediate Startup** triggers an immediate weather packet broadcast when the software receives its first UDP packet from the Tempest hub
 - **Rain onset** triggers an immediate weather + status packet (no waiting for the next scheduled interval)
 - **Status packets are suppressed** when it's not raining, keeping the frequency clear
 - **Heartbeat packets** are sent periodically during quiet weather so the station remains visible
@@ -155,6 +156,8 @@ RAIN_STATE_FILE = "C:/tempest_aprs/rain_state.json"
 |---|---|---|
 | `CALLSIGN` | Your amateur radio callsign | Required |
 | `SSID` | APRS SSID (appended as `-13`) | `13` (weather station convention) |
+| `OUTPUT_MODE` | Where the packet is routed | `"RF"`, `"APRS-IS"`, or `"BOTH"` |
+| `APRS_IS_SERVER`| Server hostname for internet-based routing | `"rotate.aprs2.net"` |
 | `LATITUDE` / `LONGITUDE` | Station position on the APRS map | Your exact location |
 | `TRANSMIT_INTERVAL` | How often weather packets are sent | `600` (10 min) for RF, `300` (5 min) if low traffic |
 | `STATUS_INTERVAL` | How often rain status packets are sent during precipitation | `300` (5 min) |

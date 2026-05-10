@@ -34,11 +34,11 @@ from datetime import datetime, timezone
 logger = logging.getLogger("tempest_aprs.formatter")
 
 # APRS destination — APTEMP identifies this as a Tempest weather station
-APRS_DEST = "APTEMP"
+APRS_DEST = "APGRWO"
 
 # Quiet-period heartbeat — sent when not raining,
 # then every 24 hours while conditions remain quiet
-HEARTBEAT_TEXT = "Tempest Weather Station to APRS - made in Python using Claude AI"
+HEARTBEAT_TEXT = "Tempest Weather Station to APRS - https://bit.ly/TempestAPRS"
 
 
 # ── Weather packet ────────────────────────────────────────────────────────────
