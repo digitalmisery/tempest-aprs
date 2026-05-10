@@ -119,7 +119,8 @@ That's it. No `pip install` needed -- the code uses only the Python standard lib
 
 1. Install [Python 3.8+](https://www.python.org/downloads/) (check "Add to PATH" during install)
 2. Install [Graywolf for Windows](https://github.com/chrissnell/graywolf/releases) -- download the latest Windows x86_64.exe and run it
-	Alternate: [Direwolf for Windows](https://github.com/wb2osz/direwolf/releases) -- download the latest release ZIP and extract it
+
+Alternate: [Direwolf for Windows](https://github.com/wb2osz/direwolf/releases) -- download the latest release ZIP and extract it
 
 No additional Python packages are needed.
 
