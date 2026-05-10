@@ -1,6 +1,6 @@
 # Tempest APRS Weather Gateway
 
-A Python gateway that receives [WeatherFlow Tempest](https://weatherflow.com/tempest-weather-system/) weather station data over your local network and transmits [APRS](http://www.aprs.org/) weather packets over 2-meter ham radio using [Direwolf](https://github.com/wb2osz/direwolf) as a software TNC.
+A Python gateway that receives [WeatherFlow Tempest](https://weatherflow.com/tempest-weather-system/) weather station data over your local network and transmits [APRS](http://www.aprs.org/) weather packets over 2-meter ham radio using [Graywolf](https://github.com/chrissnell/graywolf) (preferred) or [Direwolf](https://github.com/wb2osz/direwolf) as a software TNC.
 
 No third-party Python packages required -- uses only the Python standard library.
 
@@ -8,9 +8,11 @@ No third-party Python packages required -- uses only the Python standard library
 
 ## What It Does
 
-Your Tempest weather station hub broadcasts observation data via UDP on your LAN every minute. This software listens for those broadcasts, converts the meteorological data into properly formatted APRS weather packets, and sends them to Direwolf over a KISS TCP connection. Direwolf modulates the packets into 1200-baud AX.25 audio and keys your radio via PTT.
+Your Tempest weather station hub broadcasts observation data via UDP on your LAN every minute. This software listens for those broadcasts, converts the meteorological data into properly formatted APRS weather packets, and sends them to Graywolf or Direwolf over a KISS TCP connection. Graywolf or Direwolf modulates the packets into 1200-baud AX.25 audio and keys your radio via PTT.
 
 The result: your personal weather station data appears on the APRS network (visible on sites like [aprs.fi](https://aprs.fi)) and can be received by any APRS-capable station in radio range.
+
+If you would like your Tempest weather data to go straight to the Internet versus RF (or in addition to), the code includes an APRS-IS client as well.
 
 ### Packet Types
 
@@ -64,7 +66,8 @@ This software was developed and tested with:
 ## Software Requirements
 
 - **Python 3.8+** (no third-party packages needed)
-- **Direwolf** ([download/install](https://github.com/wb2osz/direwolf)) -- software TNC / soundcard modem
+- **Graywolf** ([download/install](https://github.com/chrissnell/graywolf)) -- software TNC / soundcard modem with web UI
+- or **Direwolf** ([download/install](https://github.com/wb2osz/direwolf)) -- software TNC / soundcard modem
 - A valid **amateur radio license** (Technician class or above in the US)
 
 ---
@@ -78,6 +81,7 @@ tempest_aprs/
 ├── aprs_formatter.py        # Builds APRS weather and status packet strings
 ├── direwolf_client.py       # KISS TCP client and AX.25 UI frame encoder
 ├── rain_tracker.py          # Rain accumulation with midnight reset and disk persistence
+├── aprs_is_client.py        # Connects to APRS-IS service for sending data via Internet
 ├── tempest_aprs.service     # systemd unit file for Raspberry Pi auto-start
 └── README.md                # This file
 ```
@@ -106,13 +110,16 @@ git clone https://github.com/digitalmisery/tempest-aprs.git tempest_aprs
 sudo apt update && sudo apt upgrade -y
 sudo apt install python3 direwolf -y
 ```
+Refer to the [Graywolf Handbook]https://chrissnell.com/software/graywolf/installation.html for Graywolf installation on Raspberry Pi 
+
 
 That's it. No `pip install` needed -- the code uses only the Python standard library.
 
 #### Windows
 
 1. Install [Python 3.8+](https://www.python.org/downloads/) (check "Add to PATH" during install)
-2. Install [Direwolf for Windows](https://github.com/wb2osz/direwolf/releases) -- download the latest release ZIP and extract it
+2. Install [Graywolf for Windows](https://github.com/chrissnell/graywolf/releases) -- download the latest Windows x86_64.exe and run it
+	Alternate: [Direwolf for Windows](https://github.com/wb2osz/direwolf/releases) -- download the latest release ZIP and extract it
 
 No additional Python packages are needed.
 
@@ -394,7 +401,7 @@ W9PEM-13>APTEMP,WIDE1-1:>Rain: Moderate (0.18in/hr)
 ### Heartbeat Packet (Quiet Weather)
 
 ```
-W9PEM-13>APTEMP,WIDE1-1:>Tempest Weather Station to APRS - made in Python using Claude AI
+W9PEM-13>APTEMP,WIDE1-1:>Tempest Weather Station to APRS - https://bit.ly/TempestAPRS
 ```
 
 ---
@@ -402,41 +409,30 @@ W9PEM-13>APTEMP,WIDE1-1:>Tempest Weather Station to APRS - made in Python using 
 ## How It Works (Architecture)
 
 ```
-┌──────────────┐    UDP broadcast    ┌────────────────┐
-│   Tempest    │ ──────────────────> │  UDP Listener  │
-│  Hub (LAN)   │    port 50222       │    Thread       │
-└──────────────┘                     └───────┬────────┘
-                                             │
-                                    updates shared state
-                                             │
-                              ┌──────────────┼──────────────┐
-                              │              │              │
-                     ┌────────▼───────┐  ┌───▼────────┐  ┌─▼──────────┐
-                     │  Weather TX    │  │ Status TX  │  │   Rain     │
-                     │  Loop Thread   │  │ Loop Thread│  │  Tracker   │
-                     │  (10 min)      │  │ (5 min)    │  │            │
-                     └────────┬───────┘  └───┬────────┘  └────────────┘
-                              │              │
-                         tx_lock serializes sends
-                              │              │
-                     ┌────────▼──────────────▼────────┐
-                     │      Direwolf Client           │
-                     │   (KISS TCP → AX.25 frames)    │
-                     └────────────────┬───────────────┘
-                                      │
-                              KISS TCP port 8001
-                                      │
-                     ┌────────────────▼───────────────┐
-                     │         Direwolf               │
-                     │   (software TNC / modem)       │
-                     └────────────────┬───────────────┘
-                                      │
-                              audio + PTT (Digirig Lite)
-                                      │
-                     ┌────────────────▼───────────────┐
-                     │        2m FM Radio             │
-                     │    (e.g., Alinco DR-135)       │
-                     └────────────────────────────────┘
+[ Tempest Hub ]
+             │
+             │ UDP Broadcast (Port 50222)
+             ▼
+    ┌───────────────────┐
+    │  tempest_aprs.py  │ (Parses JSON, builds APRS packets)
+    └───────────────────┘
+             │
+             ├──────────────────────────────┐
+             │                              │
+      OUTPUT_MODE="RF"             OUTPUT_MODE="APRS-IS"
+        (or "BOTH")                  (or "BOTH")
+             │                              │
+             ▼                              ▼
+      [ Direwolf TNC ]               [ APRS-IS Server ]
+       (KISS TCP 8001)             (TCP 14580 with Passcode)
+             │                              │
+             │ Audio/PTT                    │ Internet Route
+             ▼                              ▼
+         [ 2m Radio ]                [ aprs.fi / CWOP ]
+             │
+             │ RF (144.390 MHz)
+             ▼
+      [ Local APRS Network ]
 ```
 
 ### Thread Model
@@ -506,4 +502,4 @@ This project is released under the [MIT License](LICENSE).
 - [WeatherFlow](https://weatherflow.com/) for the Tempest weather station and its open UDP API
 - [Direwolf](https://github.com/wb2osz/direwolf) by WB2OSZ for the excellent software TNC
 - [Digirig](https://digirig.net/) for the compact USB audio/PTT interface
-- Built with the assistance of [Claude AI](https://claude.ai/) by Anthropic
+- Built with the assistance of Anthropic Claude and Google Gemini
