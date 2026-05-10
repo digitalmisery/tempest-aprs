@@ -130,6 +130,10 @@ SSID     = "13"          # SSID -13 is the convention for weather stations
 LATITUDE  =  43.3228     # Positive = North, negative = South
 LONGITUDE = -87.9849     # Positive = East,  negative = West
 
+# ── Output Routing ────────────────────────────────────────────────────────────
+# Select where to send the APRS packets. Options: "RF", "APRS-IS", or "BOTH"
+OUTPUT_MODE = "BOTH"
+
 # ── Transmit intervals (seconds) ────────────────────────────────────────────
 TRANSMIT_INTERVAL  = 600    # Weather packet: 600 = every 10 min
 STATUS_INTERVAL    = 300    # Status packet (rain active only): 300 = every 5 min
@@ -139,6 +143,10 @@ HEARTBEAT_INTERVAL = 86400  # Seconds between heartbeats during quiet periods
 # ── Direwolf connection ─────────────────────────────────────────────────────
 DIREWOLF_HOST = "127.0.0.1"
 DIREWOLF_PORT = 8001        # KISS TCP port (Direwolf default)
+
+# ── APRS-IS settings (Used if OUTPUT_MODE is "APRS-IS" or "BOTH") ─────────────
+APRS_IS_SERVER = "rotate.aprs2.net"
+APRS_IS_PORT   = 14580
 
 # ── File paths ──────────────────────────────────────────────────────────────
 # Windows:
@@ -158,6 +166,7 @@ RAIN_STATE_FILE = "C:/tempest_aprs/rain_state.json"
 | `SSID` | APRS SSID (appended as `-13`) | `13` (weather station convention) |
 | `OUTPUT_MODE` | Where the packet is routed | `"RF"`, `"APRS-IS"`, or `"BOTH"` |
 | `APRS_IS_SERVER`| Server hostname for internet-based routing | `"rotate.aprs2.net"` |
+| `APRS_IS_PORT`| Server port for internet-based routing | `14580` |
 | `LATITUDE` / `LONGITUDE` | Station position on the APRS map | Your exact location |
 | `TRANSMIT_INTERVAL` | How often weather packets are sent | `600` (10 min) for RF, `300` (5 min) if low traffic |
 | `STATUS_INTERVAL` | How often rain status packets are sent during precipitation | `300` (5 min) |
