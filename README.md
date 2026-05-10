@@ -501,6 +501,7 @@ This project is released under the [MIT License](LICENSE).
 ## Acknowledgments
 
 - [WeatherFlow](https://weatherflow.com/) for the Tempest weather station and its open UDP API
+- [Graywolf](https://github.com/chrissnell/graywolf) by Chris Snell for awesome modern software TNC
 - [Direwolf](https://github.com/wb2osz/direwolf) by WB2OSZ for the excellent software TNC
 - [Digirig](https://digirig.net/) for the compact USB audio/PTT interface
 - Built with the assistance of Anthropic Claude and Google Gemini
