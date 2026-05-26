@@ -11,10 +11,18 @@ SSID     = "13"
 LATITUDE  =  43.3228   # positive = North, negative = South
 LONGITUDE = -87.9849   # positive = East,  negative = West
 
+# ── Station Elevation & Calibration ───────────────────────────────────────────
+
+# Pressure offset in millibars (mbar / hPa).
+# The Tempest reports absolute station pressure. To send Altimeter or 
+# Sea-Level pressure via APRS, calculate the offset for your current elevation 
+# and enter it here. (e.g., if you are at 800ft, you might need around +29.5 mb)
+PRESSURE_OFFSET_MB = 30.0
+
 # ── Output Routing ────────────────────────────────────────────────────────────
 
 # Select where to send the APRS packets. Options: "RF", "APRS-IS", or "BOTH"
-OUTPUT_MODE = "BOTH"
+OUTPUT_MODE = "RF"
 
 # ── Transmit intervals ────────────────────────────────────────────────────────
 
@@ -47,5 +55,5 @@ APRS_IS_PORT   = 14580
 
 # ── File paths ────────────────────────────────────────────────────────────────
 # Windows paths for testing — change to /var/log/... and /var/lib/... on the Pi
-LOG_FILE        = "C:/tempest_aprs/tempest_aprs.log"
-RAIN_STATE_FILE = "C:/tempest_aprs/rain_state.json"
+LOG_FILE        = "/var/log/tempest_aprs.log"
+RAIN_STATE_FILE = "/var/lib/tempest_aprs/rain_state.json"

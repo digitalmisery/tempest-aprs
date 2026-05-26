@@ -141,13 +141,21 @@ def parse_obs_st(msg: dict):
     """Parse obs_st message. Returns dict or None."""
     try:
         obs = msg["obs"][0]
+        
+        # Get pressure offset from config (default to 0.0 if missing)
+        pressure_offset = getattr(config, "PRESSURE_OFFSET_MB", 0.0)
+        
+        # Apply offset safely
+        raw_pressure = obs[6]
+        adjusted_pressure = (raw_pressure + pressure_offset) if raw_pressure is not None else 0.0
+
         result = {
             "timestamp":            obs[0],
             "wind_lull":            obs[1],
             "wind_avg":             obs[2],
             "wind_gust":            obs[3],
             "wind_direction":       obs[4],
-            "pressure":             obs[6],
+            "pressure":             adjusted_pressure,  # Updated to use offset
             "temperature":          obs[7],
             "humidity":             obs[8],
             "solar_radiation":      obs[11] if len(obs) > 11 and obs[11] is not None else 0,
